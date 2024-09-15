@@ -53,7 +53,7 @@ const SCHED_EXT: i32 = 7;
 //
 // The task will be dispatched to the global shared DSQ and it will run on the first CPU available.
 #[allow(dead_code)]
-pub const RL_CPU_ANY: u64 = bpf_intf::RL_CPU_ANY as u64;
+pub const RL_CPU_ANY: i32 = bpf_intf::RL_CPU_ANY as i32;
 
 /// High-level Rust abstraction to interact with a generic sched-ext BPF component.
 ///
@@ -106,7 +106,7 @@ impl DispatchedTask {
         DispatchedTask {
             pid: task.pid,
             cpu: task.cpu,
-            flags: 0,
+            flags: task.flags,
             cpumask_cnt: task.cpumask_cnt,
             slice_ns: 0, // use default time slice
             vtime: 0,
