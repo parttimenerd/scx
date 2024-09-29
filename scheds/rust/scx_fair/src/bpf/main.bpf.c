@@ -121,6 +121,11 @@ struct task_ctx {
 	 * Task's dynamic priority multiplier (used only in lowlatency mode).
 	 */
 	u64 lat_weight;
+
+	/*
+	 * Determine if ops.select_cpu() has been called.
+	 */
+	bool select_cpu_done;
 };
 
 /* Map that contains task-local storage. */
@@ -179,6 +184,14 @@ static u64 calc_avg(u64 old_val, u64 new_val)
 static inline bool vtime_before(u64 a, u64 b)
 {
 	return (s64)(a - b) < 0;
+}
+
+/*
+ * Return true if the target task @p is a kernel thread, false instead.
+ */
+static inline bool is_kthread(const struct task_struct *p)
+{
+	return p->flags & PF_KTHREAD;
 }
 
 /*
@@ -257,11 +270,20 @@ static s32 pick_idle_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 		return -ENOENT;
 
 	/*
-	 * If the task can only run on one CPU, simply dispatch it to the local
-	 * DSQ of the CPU that can be used.
+	 * For tasks that can run only on a single CPU, we can simply verify if
+	 * their only allowed CPU is still idle.
 	 */
-	if (p->nr_cpus_allowed == 1)
-		return prev_cpu;
+	if (p->nr_cpus_allowed == 1) {
+		if (scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+			return prev_cpu;
+		/*
+		 * If local_kthreads is enabled, always dispatch per-CPU
+		 * kthreads directly, even if their allowed CPU is not idle.
+		 */
+		if (local_kthreads && is_kthread(p))
+			return prev_cpu;
+		return -ENOENT;
+	}
 
 	/*
 	 * Task scheduling domain.
@@ -428,24 +450,24 @@ out_put_cpumask:
 s32 BPF_STRUCT_OPS(fair_select_cpu, struct task_struct *p,
 			s32 prev_cpu, u64 wake_flags)
 {
+	struct task_ctx *tctx;
 	s32 cpu;
+
+	tctx = try_lookup_task_ctx(p);
+	if (!tctx)
+		return prev_cpu;
 
 	cpu = pick_idle_cpu(p, prev_cpu, wake_flags);
 	if (cpu >= 0) {
 		scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
 		__sync_fetch_and_add(&nr_direct_dispatches, 1);
-		return cpu;
+	} else {
+		cpu = prev_cpu;
 	}
 
-	return prev_cpu;
-}
+	tctx->select_cpu_done = true;
 
-/*
- * Return true if the target task @p is a kernel thread, false instead.
- */
-static inline bool is_kthread(const struct task_struct *p)
-{
-	return p->flags & PF_KTHREAD;
+	return cpu;
 }
 
 /*
@@ -454,17 +476,29 @@ static inline bool is_kthread(const struct task_struct *p)
  */
 void BPF_STRUCT_OPS(fair_enqueue, struct task_struct *p, u64 enq_flags)
 {
-	s32 prev_cpu = scx_bpf_task_cpu(p);
+	struct task_ctx *tctx;
+	s32 cpu, prev_cpu = scx_bpf_task_cpu(p);
 	u64 vtime = task_vtime(p);
 
 	/*
-	 * Dispatch per-CPU kthreads directly on their CPU if kthread
-	 * prioritization is enabled.
+	 * During ttwu, the kernel may decide to skip ->select_task_rq() (e.g.,
+	 * when only one CPU is allowed or migration is disabled). This causes
+	 * to call ops.enqueue() directly without having a chance to call
+	 * ops.select_cpu().
+	 *
+	 * Therefore, rely on the flag tctx->select_cpu_done to determine if
+	 * ops.select_cpu() was called, if not check for idle CPU directly here
+	 * from ops.enqueue(), giving the task a chance to be dispatched
+	 * directly on an idle CPU, without going to the shared DSQ.
 	 */
-	if (local_kthreads && is_kthread(p) && p->nr_cpus_allowed == 1) {
-		scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
-		__sync_fetch_and_add(&nr_shared_dispatches, 1);
-		return;
+	tctx = try_lookup_task_ctx(p);
+	if (tctx && !tctx->select_cpu_done) {
+		cpu = pick_idle_cpu(p, prev_cpu, 0);
+		if (cpu >= 0) {
+			scx_bpf_dispatch(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, enq_flags);
+			__sync_fetch_and_add(&nr_direct_dispatches, 1);
+			return;
+		}
 	}
 
 	/*
@@ -475,15 +509,12 @@ void BPF_STRUCT_OPS(fair_enqueue, struct task_struct *p, u64 enq_flags)
 	__sync_fetch_and_add(&nr_shared_dispatches, 1);
 
 	/*
-	 * If we aren't in the wakeup path (e.g., task being re-enqueued after
-	 * slice exhaustion), ops.select_cpu() hasn't run and thus we haven't
-	 * looked for and kicked an idle CPU, let's do it now.
+	 * If there are idle CPUs that are usable by the task, wake them up to
+	 * see whether they'd be able to steal the just queued task.
 	 */
-	if (!(enq_flags & SCX_ENQ_WAKEUP)) {
-		s32 cpu = pick_idle_cpu(p, prev_cpu, 0);
-		if (cpu >= 0)
-			scx_bpf_kick_cpu(cpu, 0);
-	}
+	cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+	if (cpu >= 0)
+		scx_bpf_kick_cpu(cpu, 0);
 }
 
 void BPF_STRUCT_OPS(fair_dispatch, s32 cpu, struct task_struct *prev)
@@ -595,6 +626,8 @@ void BPF_STRUCT_OPS(fair_stopping, struct task_struct *p, bool runnable)
 	tctx = try_lookup_task_ctx(p);
 	if (!tctx)
 		return;
+	tctx->select_cpu_done = false;
+
 	slice = MIN(p->se.sum_exec_runtime - tctx->sum_exec_runtime, slice_max);
 	slice = scale_inverse_fair(p, slice);
 	tctx->sum_exec_runtime = p->se.sum_exec_runtime;
