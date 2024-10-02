@@ -873,26 +873,6 @@ void BPF_STRUCT_OPS(bpfland_enqueue, struct task_struct *p, u64 enq_flags)
 	s32 cpu = scx_bpf_task_cpu(p);
 
 	/*
-	 * During ttwu, the kernel may decide to skip ->select_task_rq() (e.g.,
-	 * when only one CPU is allowed or migration is disabled). This causes
-	 * to call ops.enqueue() directly without having a chance to call
-	 * ops.select_cpu().
-	 *
-	 * Therefore, rely on the flag tctx->select_cpu_done to determine if
-	 * ops.select_cpu() was called, if not check for idle CPU directly here
-	 * from ops.enqueue(), giving the task a chance to be dispatched
-	 * directly on an idle CPU, without going to the shared DSQ.
-	 */
-	tctx = try_lookup_task_ctx(p);
-	if (tctx && !tctx->select_cpu_done) {
-		cpu = pick_idle_cpu(p, cpu, 0);
-		if (cpu >= 0 && !dispatch_direct_cpu(p, cpu, 0)) {
-			__sync_fetch_and_add(&nr_direct_dispatches, 1);
-			return;
-		}
-	}
-
-	/*
 	 * Dispatch interactive tasks to the priority DSQ and regular tasks to
 	 * the shared DSQ.
 	 *
@@ -912,12 +892,29 @@ void BPF_STRUCT_OPS(bpfland_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
-	 * If there are idle CPUs that are usable by the task, wake them up to
-	 * see whether they'd be able to steal the just queued task.
+	 * During ttwu, the kernel may decide to skip ->select_task_rq() (e.g.,
+	 * when only one CPU is allowed or migration is disabled). This causes
+	 * to call ops.enqueue() directly without having a chance to call
+	 * ops.select_cpu().
+	 *
+	 * Therefore, rely on the flag tctx->select_cpu_done to determine if
+	 * ops.select_cpu() was called, if not check for the best idle CPU
+	 * here and wake-up the CPU.
 	 */
-	cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
-	if (cpu >= 0)
-		scx_bpf_kick_cpu(cpu, 0);
+	tctx = try_lookup_task_ctx(p);
+	if (tctx && !tctx->select_cpu_done) {
+		cpu = pick_idle_cpu(p, cpu, 0);
+		if (cpu >= 0)
+			scx_bpf_kick_cpu(cpu, 0);
+	} else {
+		/*
+		 * Try to wake up any CPU usable by the task and to see whether
+		 * they'd be able to steal the just queued task.
+		 */
+		cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr, 0);
+		if (cpu >= 0)
+			scx_bpf_kick_cpu(cpu, 0);
+	}
 }
 
 /*
